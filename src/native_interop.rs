@@ -3,6 +3,9 @@ use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
 };
+
+/// `MONITORINFOF_PRIMARY` — not re-exported by this `windows` crate version.
+const MONITORINFOF_PRIMARY: u32 = 0x0000_0001;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -35,10 +38,15 @@ pub struct TaskbarWindow {
     /// anchored to the same physical monitor across topology changes, where the
     /// geometric ordering (and therefore the index) of taskbars can shift.
     pub device: String,
+    /// True if this taskbar lives on the primary monitor. Used as the fallback
+    /// anchor when the remembered device is gone, so we never re-trigger the
+    /// "widget jumps to the topmost (often secondary) taskbar" bug (#43).
+    pub is_primary: bool,
 }
 
-/// Stable identifier of the monitor a window currently lives on.
-pub fn monitor_device_name(hwnd: HWND) -> String {
+/// Stable identity of the monitor a window currently lives on: its device name
+/// and whether it is the primary monitor.
+pub fn monitor_identity(hwnd: HWND) -> (String, bool) {
     unsafe {
         let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         let mut info = MONITORINFOEXW::default();
@@ -49,9 +57,11 @@ pub fn monitor_device_name(hwnd: HWND) -> String {
                 .iter()
                 .position(|&c| c == 0)
                 .unwrap_or(info.szDevice.len());
-            String::from_utf16_lossy(&info.szDevice[..len])
+            let device = String::from_utf16_lossy(&info.szDevice[..len]);
+            let is_primary = info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0;
+            (device, is_primary)
         } else {
-            String::new()
+            (String::new(), false)
         }
     }
 }
@@ -65,8 +75,13 @@ pub fn find_taskbars() -> Vec<TaskbarWindow> {
             let class_name = String::from_utf16_lossy(&class_name[..len as usize]);
             if class_name == "Shell_TrayWnd" || class_name == "Shell_SecondaryTrayWnd" {
                 if let Some(rect) = get_taskbar_rect(hwnd).or_else(|| get_window_rect_safe(hwnd)) {
-                    let device = monitor_device_name(hwnd);
-                    taskbars.push(TaskbarWindow { hwnd, rect, device });
+                    let (device, is_primary) = monitor_identity(hwnd);
+                    taskbars.push(TaskbarWindow {
+                        hwnd,
+                        rect,
+                        device,
+                        is_primary,
+                    });
                 }
             }
         }
