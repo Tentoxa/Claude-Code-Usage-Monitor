@@ -3600,40 +3600,8 @@ fn draw_row(
             }
             model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
         }
-        if show_codex {
-            if codex_available {
-                draw_usage_bar(
-                    hdc,
-                    model_x,
-                    y,
-                    segment_count,
-                    codex_percent,
-                    codex_text,
-                    codex_accent,
-                    track,
-                    &codex_value_color,
-                );
-            }
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_antigravity {
-            if antigravity_available {
-                draw_usage_bar(
-                    hdc,
-                    model_x,
-                    y,
-                    segment_count,
-                    antigravity_percent,
-                    antigravity_text,
-                    antigravity_accent,
-                    track,
-                    &antigravity_value_color,
-                );
-            }
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
-        }
-        // The Fable weekly meter is appended after all provider columns so the
-        // shared session/weekly columns stay aligned across both rows.
+        // Fable is a Claude sub-limit, so keep its column directly beside
+        // Claude before the independent Codex and Antigravity providers.
         if show_claude_code {
             if let Some((fable_percent, fable_text, fable_accent)) = fable {
                 draw_usage_bar(
@@ -3664,6 +3632,40 @@ fn draw_row(
                     &mut label_wide,
                     &mut label_rect,
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                );
+            }
+            if fable.is_some() || fable_label.is_some() {
+                model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
+            }
+        }
+        if show_codex {
+            if codex_available {
+                draw_usage_bar(
+                    hdc,
+                    model_x,
+                    y,
+                    segment_count,
+                    codex_percent,
+                    codex_text,
+                    codex_accent,
+                    track,
+                    &codex_value_color,
+                );
+            }
+            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
+        }
+        if show_antigravity {
+            if antigravity_available {
+                draw_usage_bar(
+                    hdc,
+                    model_x,
+                    y,
+                    segment_count,
+                    antigravity_percent,
+                    antigravity_text,
+                    antigravity_accent,
+                    track,
+                    &antigravity_value_color,
                 );
             }
         }
