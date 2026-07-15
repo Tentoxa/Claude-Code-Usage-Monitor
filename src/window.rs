@@ -2630,6 +2630,9 @@ unsafe extern "system" fn wnd_proc(
         WM_APP_USAGE_UPDATED => {
             check_theme_change();
             check_language_change();
+            // Fable can change the widget width after a poll; re-anchor the
+            // right edge before rendering so it never grows into the tray.
+            position_at_taskbar();
             render_layered();
             schedule_countdown_timer();
             suppress_tray_reposition_for(Duration::from_millis(
