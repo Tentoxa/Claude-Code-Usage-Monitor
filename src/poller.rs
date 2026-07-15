@@ -102,6 +102,7 @@ struct CodexRateLimitDetails {
 struct CodexRateLimitWindow {
     used_percent: f64,
     reset_at: i64,
+    limit_window_seconds: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -932,26 +933,50 @@ fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData,
     codex_usage_from_response(response).ok_or(PollError::RequestFailed)
 }
 
+#[derive(Clone, Copy)]
+enum CodexWindowKind {
+    Session,
+    Weekly,
+}
+
+fn codex_window_kind(window: &CodexRateLimitWindow, fallback: CodexWindowKind) -> CodexWindowKind {
+    const LONG_WINDOW_MIN_SECONDS: i64 = 24 * 60 * 60;
+
+    match window.limit_window_seconds {
+        Some(seconds) if seconds >= LONG_WINDOW_MIN_SECONDS => CodexWindowKind::Weekly,
+        Some(_) => CodexWindowKind::Session,
+        None => fallback,
+    }
+}
+
+fn insert_codex_window(
+    data: &mut UsageData,
+    window: CodexRateLimitWindow,
+    fallback: CodexWindowKind,
+) {
+    let section = codex_section_from_window(&window);
+    let preferred = codex_window_kind(&window, fallback);
+    match preferred {
+        CodexWindowKind::Session if data.session.is_none() => data.session = Some(section),
+        CodexWindowKind::Weekly if data.weekly.is_none() => data.weekly = Some(section),
+        CodexWindowKind::Session if data.weekly.is_none() => data.weekly = Some(section),
+        CodexWindowKind::Weekly if data.session.is_none() => data.session = Some(section),
+        _ => {}
+    }
+}
+
 fn codex_usage_from_response(response: CodexUsageResponse) -> Option<UsageData> {
     let details = *response.rate_limit.flatten()?;
-    let session = details
-        .primary_window
-        .flatten()
-        .map(|window| codex_section_from_window(&window));
-    let weekly = details
-        .secondary_window
-        .flatten()
-        .map(|window| codex_section_from_window(&window));
+    let mut data = UsageData::default();
 
-    if session.is_none() && weekly.is_none() {
-        None
-    } else {
-        Some(UsageData {
-            session,
-            weekly,
-            fable: None,
-        })
+    if let Some(window) = details.primary_window.flatten() {
+        insert_codex_window(&mut data, *window, CodexWindowKind::Session);
     }
+    if let Some(window) = details.secondary_window.flatten() {
+        insert_codex_window(&mut data, *window, CodexWindowKind::Weekly);
+    }
+
+    (data.session.is_some() || data.weekly.is_some()).then_some(data)
 }
 
 fn codex_section_from_window(window: &CodexRateLimitWindow) -> UsageSection {
@@ -1882,6 +1907,34 @@ mod tests {
             37.0
         );
         assert!(usage.weekly.is_none());
+    }
+
+    #[test]
+    fn codex_places_weekly_primary_window_by_reported_duration() {
+        let response: CodexUsageResponse = serde_json::from_str(
+            r#"{
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 28.0,
+                        "limit_window_seconds": 604800,
+                        "reset_at": 1784666227
+                    },
+                    "secondary_window": null
+                }
+            }"#,
+        )
+        .expect("Codex response should deserialize");
+
+        let usage = codex_usage_from_response(response).expect("weekly limit should be usable");
+        assert!(usage.session.is_none());
+        assert_eq!(
+            usage
+                .weekly
+                .as_ref()
+                .expect("weekly limit should be present")
+                .percentage,
+            28.0
+        );
     }
 
     #[test]
