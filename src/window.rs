@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -70,6 +71,7 @@ struct AppState {
     fable_percent: f64,
     fable_text: String,
     fable_active: bool,
+    limits: LimitAvailability,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
@@ -96,6 +98,29 @@ struct AppState {
     drag_start_offset: i32,
 
     widget_visible: bool,
+}
+
+#[derive(Clone, Copy)]
+struct LimitAvailability {
+    claude_session: bool,
+    claude_weekly: bool,
+    codex_session: bool,
+    codex_weekly: bool,
+    antigravity_session: bool,
+    antigravity_weekly: bool,
+}
+
+impl LimitAvailability {
+    const fn pending() -> Self {
+        Self {
+            claude_session: true,
+            claude_weekly: true,
+            codex_session: true,
+            codex_weekly: true,
+            antigravity_session: true,
+            antigravity_weekly: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -433,50 +458,90 @@ fn save_state_settings() {
     }
 }
 
+fn usage_tooltip(
+    model: &str,
+    session: Option<&str>,
+    weekly: Option<&str>,
+    fable: Option<&str>,
+) -> String {
+    let mut tooltip = String::with_capacity(96);
+    tooltip.push_str(model);
+    if let Some(text) = session {
+        let _ = write!(tooltip, " 5h: {text}");
+    }
+    if let Some(text) = weekly {
+        let _ = write!(tooltip, " | 7d: {text}");
+    }
+    if let Some(text) = fable {
+        let _ = write!(tooltip, " | Fable 7d: {text}");
+    }
+    tooltip
+}
+
 fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
     let state = lock_state();
     match state.as_ref() {
         Some(s) if s.last_poll_ok => {
             let mut icons = Vec::new();
             if s.show_claude_code {
-                let claude_tooltip = format!(
-                    "{} 5h: {} | 7d: {}",
-                    s.language.strings().claude_code_model,
-                    s.session_text,
-                    s.weekly_text
-                );
-                let claude_tooltip = if s.fable_active && s.show_fable {
-                    format!("{claude_tooltip} | Fable 7d: {}", s.fable_text)
-                } else {
-                    claude_tooltip
-                };
+                let fable_visible = s.fable_active && s.show_fable;
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Claude,
-                    percent: Some(s.session_percent),
-                    tooltip: claude_tooltip,
+                    percent: s
+                        .limits
+                        .claude_session
+                        .then_some(s.session_percent)
+                        .or_else(|| s.limits.claude_weekly.then_some(s.weekly_percent))
+                        .or_else(|| fable_visible.then_some(s.fable_percent)),
+                    tooltip: usage_tooltip(
+                        s.language.strings().claude_code_model,
+                        s.limits.claude_session.then_some(s.session_text.as_str()),
+                        s.limits.claude_weekly.then_some(s.weekly_text.as_str()),
+                        fable_visible.then_some(s.fable_text.as_str()),
+                    ),
                 });
             }
             if s.show_codex {
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Codex,
-                    percent: Some(s.codex_session_percent),
-                    tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
+                    percent: s
+                        .limits
+                        .codex_session
+                        .then_some(s.codex_session_percent)
+                        .or_else(|| s.limits.codex_weekly.then_some(s.codex_weekly_percent)),
+                    tooltip: usage_tooltip(
                         s.language.strings().codex_model,
-                        s.codex_session_text,
-                        s.codex_weekly_text
+                        s.limits
+                            .codex_session
+                            .then_some(s.codex_session_text.as_str()),
+                        s.limits
+                            .codex_weekly
+                            .then_some(s.codex_weekly_text.as_str()),
+                        None,
                     ),
                 });
             }
             if s.show_antigravity {
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Antigravity,
-                    percent: Some(s.antigravity_session_percent),
-                    tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
+                    percent: s
+                        .limits
+                        .antigravity_session
+                        .then_some(s.antigravity_session_percent)
+                        .or_else(|| {
+                            s.limits
+                                .antigravity_weekly
+                                .then_some(s.antigravity_weekly_percent)
+                        }),
+                    tooltip: usage_tooltip(
                         s.language.strings().antigravity_model,
-                        s.antigravity_session_text,
-                        s.antigravity_weekly_text
+                        s.limits
+                            .antigravity_session
+                            .then_some(s.antigravity_session_text.as_str()),
+                        s.limits
+                            .antigravity_weekly
+                            .then_some(s.antigravity_weekly_text.as_str()),
+                        None,
                     ),
                 });
             }
@@ -541,7 +606,11 @@ fn toggle_widget_visibility(hwnd: HWND) {
 /// Friendly menu label for a monitor device, e.g. "\\.\DISPLAY2" -> "Monitor 2".
 /// Falls back to a 1-based index when the device name has no trailing number.
 fn monitor_display_name(device: &str, index: usize, monitor_word: &str) -> String {
-    let number: String = device.chars().rev().take_while(|c| c.is_ascii_digit()).collect();
+    let number: String = device
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     let number: String = number.chars().rev().collect();
     if number.is_empty() {
         format!("{} {}", monitor_word, index + 1)
@@ -733,32 +802,47 @@ fn refresh_usage_texts(state: &mut AppState) {
     };
 
     if let Some(claude_code) = data.claude_code.as_ref() {
-        state.session_text = poller::format_line(&claude_code.session, strings);
-        state.weekly_text = poller::format_line(&claude_code.weekly, strings);
-        if let Some(fable) = claude_code.fable.as_ref() {
-            state.fable_text = poller::format_line(fable, strings);
-        }
+        state.session_text = claude_code
+            .session
+            .as_ref()
+            .map_or_else(String::new, |section| poller::format_line(section, strings));
+        state.weekly_text = claude_code
+            .weekly
+            .as_ref()
+            .map_or_else(String::new, |section| poller::format_line(section, strings));
+        state.fable_text = claude_code
+            .fable
+            .as_ref()
+            .map_or_else(String::new, |section| poller::format_line(section, strings));
     } else if state.show_claude_code {
         state.session_text = "!".to_string();
         state.weekly_text = "!".to_string();
+        state.fable_text = "!".to_string();
     }
 
     if let Some(codex) = data.codex.as_ref() {
-        state.codex_session_text = poller::format_line(&codex.session, strings);
-        state.codex_weekly_text = poller::format_line(&codex.weekly, strings);
+        state.codex_session_text = codex
+            .session
+            .as_ref()
+            .map_or_else(String::new, |section| poller::format_line(section, strings));
+        state.codex_weekly_text = codex
+            .weekly
+            .as_ref()
+            .map_or_else(String::new, |section| poller::format_line(section, strings));
     } else if state.show_codex {
         state.codex_session_text = "!".to_string();
         state.codex_weekly_text = "!".to_string();
     }
 
     if let Some(antigravity) = data.antigravity.as_ref() {
-        state.antigravity_session_text = poller::format_line(&antigravity.session, strings);
-        state.antigravity_weekly_text =
-            if antigravity.weekly.resets_at.is_none() && antigravity.weekly.percentage == 0.0 {
-                "--".to_string()
-            } else {
-                poller::format_line(&antigravity.weekly, strings)
-            };
+        state.antigravity_session_text = antigravity
+            .session
+            .as_ref()
+            .map_or_else(String::new, |section| poller::format_line(section, strings));
+        state.antigravity_weekly_text = antigravity
+            .weekly
+            .as_ref()
+            .map_or_else(String::new, |section| poller::format_line(section, strings));
     } else if state.show_antigravity {
         state.antigravity_session_text = "!".to_string();
         state.antigravity_weekly_text = "!".to_string();
@@ -1433,6 +1517,7 @@ pub fn run() {
                 fable_percent: 0.0,
                 fable_text: "--".to_string(),
                 fable_active: false,
+                limits: LimitAvailability::pending(),
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
@@ -1568,6 +1653,7 @@ fn render_layered() {
         fable_pct,
         fable_text,
         fable_active,
+        limits,
         show_claude_code,
         show_codex,
         show_antigravity,
@@ -1594,6 +1680,7 @@ fn render_layered() {
                 s.fable_percent,
                 s.fable_text.clone(),
                 s.fable_active && s.show_fable,
+                s.limits,
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
@@ -1693,6 +1780,7 @@ fn render_layered() {
             fable_pct,
             &fable_text,
             fable_active,
+            limits,
             show_claude_code,
             show_codex,
             show_antigravity,
@@ -1747,6 +1835,23 @@ fn render_layered() {
     }
 }
 
+fn usage_row_positions(
+    height: i32,
+    session_visible: bool,
+    weekly_visible: bool,
+) -> (Option<i32>, Option<i32>) {
+    let centered_y = (height - sc(SEGMENT_H)) / 2;
+    match (session_visible, weekly_visible) {
+        (true, true) => {
+            let weekly_y = height - sc(5) - sc(SEGMENT_H);
+            (Some(weekly_y - sc(10) - sc(SEGMENT_H)), Some(weekly_y))
+        }
+        (true, false) => (Some(centered_y), None),
+        (false, true) => (None, Some(centered_y)),
+        (false, false) => (None, None),
+    }
+}
+
 /// Paint all widget content onto a DC with a given background color.
 fn paint_content(
     hdc: HDC,
@@ -1773,6 +1878,7 @@ fn paint_content(
     fable_pct: f64,
     fable_text: &str,
     fable_active: bool,
+    limits: LimitAvailability,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
@@ -1830,8 +1936,16 @@ fn paint_content(
         let _ = DeleteObject(right_brush);
 
         let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
-        let row2_y = height - sc(5) - sc(SEGMENT_H);
-        let row1_y = row2_y - sc(10) - sc(SEGMENT_H);
+        let session_has_limit = (show_claude_code && limits.claude_session)
+            || (show_codex && limits.codex_session)
+            || (show_antigravity && limits.antigravity_session);
+        let weekly_has_limit = (show_claude_code && limits.claude_weekly)
+            || (show_codex && limits.codex_weekly)
+            || (show_antigravity && limits.antigravity_weekly);
+        let session_row_visible = session_has_limit || fable_active;
+        let weekly_row_visible = weekly_has_limit || fable_active;
+        let (session_y, weekly_y) =
+            usage_row_positions(height, session_row_visible, weekly_row_visible);
 
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
@@ -1864,54 +1978,64 @@ fn paint_content(
         };
         let fable_label = if fable_active { Some("Fable") } else { None };
 
-        draw_row(
-            hdc,
-            content_x,
-            row1_y,
-            is_dark,
-            text_color,
-            strings.session_window,
-            session_pct,
-            session_text,
-            codex_session_pct,
-            codex_session_text,
-            antigravity_session_pct,
-            antigravity_session_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            accent,
-            codex_accent,
-            antigravity_accent,
-            track,
-            // Session row has no Fable bar, only the heading label.
-            None,
-            fable_label,
-        );
-        draw_row(
-            hdc,
-            content_x,
-            row2_y,
-            is_dark,
-            text_color,
-            strings.weekly_window,
-            weekly_pct,
-            weekly_text,
-            codex_weekly_pct,
-            codex_weekly_text,
-            antigravity_weekly_pct,
-            antigravity_weekly_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            accent,
-            codex_accent,
-            antigravity_accent,
-            track,
-            fable_bar,
-            // Weekly row draws the Fable bar itself, no separate heading.
-            None,
-        );
+        if let Some(y) = session_y {
+            draw_row(
+                hdc,
+                content_x,
+                y,
+                is_dark,
+                text_color,
+                strings.session_window,
+                session_pct,
+                session_text,
+                codex_session_pct,
+                codex_session_text,
+                antigravity_session_pct,
+                antigravity_session_text,
+                show_claude_code,
+                show_codex,
+                show_antigravity,
+                limits.claude_session,
+                limits.codex_session,
+                limits.antigravity_session,
+                accent,
+                codex_accent,
+                antigravity_accent,
+                track,
+                // Session row has no Fable bar, only the heading label.
+                None,
+                fable_label,
+            );
+        }
+        if let Some(y) = weekly_y {
+            draw_row(
+                hdc,
+                content_x,
+                y,
+                is_dark,
+                text_color,
+                strings.weekly_window,
+                weekly_pct,
+                weekly_text,
+                codex_weekly_pct,
+                codex_weekly_text,
+                antigravity_weekly_pct,
+                antigravity_weekly_text,
+                show_claude_code,
+                show_codex,
+                show_antigravity,
+                limits.claude_weekly,
+                limits.codex_weekly,
+                limits.antigravity_weekly,
+                accent,
+                codex_accent,
+                antigravity_accent,
+                track,
+                fable_bar,
+                // Weekly row draws the Fable bar itself, no separate heading.
+                None,
+            );
+        }
 
         SelectObject(hdc, old_font);
         let _ = DeleteObject(font);
@@ -1933,32 +2057,47 @@ fn do_poll(send_hwnd: SendHwnd) {
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {
                 if let Some(claude_code) = data.claude_code.as_ref() {
-                    s.session_percent = claude_code.session.percentage;
-                    s.weekly_percent = claude_code.weekly.percentage;
+                    s.limits.claude_session = claude_code.session.is_some();
+                    s.limits.claude_weekly = claude_code.weekly.is_some();
+                    s.session_percent = claude_code
+                        .session
+                        .as_ref()
+                        .map_or(0.0, |section| section.percentage);
+                    s.weekly_percent = claude_code
+                        .weekly
+                        .as_ref()
+                        .map_or(0.0, |section| section.percentage);
                     if let Some(fable) = claude_code.fable.as_ref() {
                         s.fable_percent = fable.percentage;
                         s.fable_active = true;
                     } else {
+                        s.fable_percent = 0.0;
                         s.fable_active = false;
                     }
-                } else if s.show_claude_code {
-                    s.session_percent = 0.0;
-                    s.weekly_percent = 0.0;
-                    s.fable_active = false;
                 }
                 if let Some(codex) = data.codex.as_ref() {
-                    s.codex_session_percent = codex.session.percentage;
-                    s.codex_weekly_percent = codex.weekly.percentage;
-                } else if s.show_codex {
-                    s.codex_session_percent = 0.0;
-                    s.codex_weekly_percent = 0.0;
+                    s.limits.codex_session = codex.session.is_some();
+                    s.limits.codex_weekly = codex.weekly.is_some();
+                    s.codex_session_percent = codex
+                        .session
+                        .as_ref()
+                        .map_or(0.0, |section| section.percentage);
+                    s.codex_weekly_percent = codex
+                        .weekly
+                        .as_ref()
+                        .map_or(0.0, |section| section.percentage);
                 }
                 if let Some(antigravity) = data.antigravity.as_ref() {
-                    s.antigravity_session_percent = antigravity.session.percentage;
-                    s.antigravity_weekly_percent = antigravity.weekly.percentage;
-                } else if s.show_antigravity {
-                    s.antigravity_session_percent = 0.0;
-                    s.antigravity_weekly_percent = 0.0;
+                    s.limits.antigravity_session = antigravity.session.is_some();
+                    s.limits.antigravity_weekly = antigravity.weekly.is_some();
+                    s.antigravity_session_percent = antigravity
+                        .session
+                        .as_ref()
+                        .map_or(0.0, |section| section.percentage);
+                    s.antigravity_weekly_percent = antigravity
+                        .weekly
+                        .as_ref()
+                        .map_or(0.0, |section| section.percentage);
                 }
                 // Stop fast-poll if reset data is now fresh
                 if !poller::app_is_past_reset(&data) {
@@ -2137,22 +2276,32 @@ fn schedule_countdown_timer() {
     let delays = [
         data.claude_code
             .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
+            .and_then(|usage| usage.session.as_ref())
+            .and_then(|section| poller::time_until_display_change(section.resets_at)),
         data.claude_code
             .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
+            .and_then(|usage| usage.weekly.as_ref())
+            .and_then(|section| poller::time_until_display_change(section.resets_at)),
+        data.claude_code
+            .as_ref()
+            .and_then(|usage| usage.fable.as_ref())
+            .and_then(|section| poller::time_until_display_change(section.resets_at)),
         data.codex
             .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
+            .and_then(|usage| usage.session.as_ref())
+            .and_then(|section| poller::time_until_display_change(section.resets_at)),
         data.codex
             .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
+            .and_then(|usage| usage.weekly.as_ref())
+            .and_then(|section| poller::time_until_display_change(section.resets_at)),
         data.antigravity
             .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
+            .and_then(|usage| usage.session.as_ref())
+            .and_then(|section| poller::time_until_display_change(section.resets_at)),
         data.antigravity
             .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
+            .and_then(|usage| usage.weekly.as_ref())
+            .and_then(|section| poller::time_until_display_change(section.resets_at)),
     ];
     let min_delay = delays.into_iter().flatten().min();
 
@@ -2657,8 +2806,12 @@ unsafe extern "system" fn wnd_proc(
                                 s.tray_offset = new_offset;
                             }
                         }
-                        if attach_to_taskbar(hwnd, target_index, Some(&target_taskbar.device), false)
-                        {
+                        if attach_to_taskbar(
+                            hwnd,
+                            target_index,
+                            Some(&target_taskbar.device),
+                            false,
+                        ) {
                             position_at_taskbar();
                             render_layered();
                         }
@@ -3246,6 +3399,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         fable_pct,
         fable_text,
         fable_active,
+        limits,
         show_claude_code,
         show_codex,
         show_antigravity,
@@ -3270,6 +3424,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.fable_percent,
                 s.fable_text.clone(),
                 s.fable_active && s.show_fable,
+                s.limits,
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
@@ -3337,6 +3492,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             fable_pct,
             &fable_text,
             fable_active,
+            limits,
             show_claude_code,
             show_codex,
             show_antigravity,
@@ -3369,6 +3525,9 @@ fn draw_row(
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    claude_available: bool,
+    codex_available: bool,
+    antigravity_available: bool,
     claude_accent: &Color,
     codex_accent: &Color,
     antigravity_accent: &Color,
@@ -3398,64 +3557,76 @@ fn draw_row(
     // The Fable value is always tinted so it is distinguishable from the
     // adjacent weekly-all bar even when Claude Code is the only provider.
     let fable_value_color = fable_usage_text_color(is_dark);
+    let row_has_limit = (show_claude_code && claude_available)
+        || (show_codex && codex_available)
+        || (show_antigravity && antigravity_available)
+        || fable.is_some();
 
     unsafe {
-        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-        let mut label_wide: Vec<u16> = label.encode_utf16().collect();
-        let mut label_rect = RECT {
-            left: x,
-            top: y,
-            right: x + sc(LABEL_WIDTH),
-            bottom: y + seg_h,
-        };
-        let _ = DrawTextW(
-            hdc,
-            &mut label_wide,
-            &mut label_rect,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-        );
+        if row_has_limit {
+            let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+            let mut label_wide: Vec<u16> = label.encode_utf16().collect();
+            let mut label_rect = RECT {
+                left: x,
+                top: y,
+                right: x + sc(LABEL_WIDTH),
+                bottom: y + seg_h,
+            };
+            let _ = DrawTextW(
+                hdc,
+                &mut label_wide,
+                &mut label_rect,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            );
+        }
 
         let mut model_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
         if show_claude_code {
-            draw_usage_bar(
-                hdc,
-                model_x,
-                y,
-                segment_count,
-                claude_percent,
-                claude_text,
-                claude_accent,
-                track,
-                &claude_value_color,
-            );
+            if claude_available {
+                draw_usage_bar(
+                    hdc,
+                    model_x,
+                    y,
+                    segment_count,
+                    claude_percent,
+                    claude_text,
+                    claude_accent,
+                    track,
+                    &claude_value_color,
+                );
+            }
             model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
         }
         if show_codex {
-            draw_usage_bar(
-                hdc,
-                model_x,
-                y,
-                segment_count,
-                codex_percent,
-                codex_text,
-                codex_accent,
-                track,
-                &codex_value_color,
-            );
+            if codex_available {
+                draw_usage_bar(
+                    hdc,
+                    model_x,
+                    y,
+                    segment_count,
+                    codex_percent,
+                    codex_text,
+                    codex_accent,
+                    track,
+                    &codex_value_color,
+                );
+            }
             model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
         }
         if show_antigravity {
-            draw_usage_bar(
-                hdc,
-                model_x,
-                y,
-                segment_count,
-                antigravity_percent,
-                antigravity_text,
-                antigravity_accent,
-                track,
-                &antigravity_value_color,
-            );
+            if antigravity_available {
+                draw_usage_bar(
+                    hdc,
+                    model_x,
+                    y,
+                    segment_count,
+                    antigravity_percent,
+                    antigravity_text,
+                    antigravity_accent,
+                    track,
+                    &antigravity_value_color,
+                );
+            }
             model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
         }
         // The Fable weekly meter is appended after all provider columns so the
@@ -3599,5 +3770,26 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
         let _ = FillRgn(hdc, rgn, brush);
         let _ = DeleteObject(rgn);
         let _ = DeleteObject(brush);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_available_limit_uses_one_centered_row() {
+        let (session_y, weekly_y) = usage_row_positions(sc(WIDGET_HEIGHT), true, false);
+
+        assert_eq!(session_y, Some((sc(WIDGET_HEIGHT) - sc(SEGMENT_H)) / 2));
+        assert_eq!(weekly_y, None);
+    }
+
+    #[test]
+    fn tooltip_omits_unavailable_weekly_limit() {
+        let tooltip = usage_tooltip("Codex", Some("42%"), None, None);
+
+        assert_eq!(tooltip, "Codex 5h: 42%");
+        assert!(!tooltip.contains("7d"));
     }
 }
