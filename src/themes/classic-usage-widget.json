@@ -13,9 +13,9 @@
         },
         "nest": "taskbar",
         "horizontal": "left",
-        "vertical": "bottom",
+        "vertical": "center",
         "surface_horizontal": "right",
-        "surface_vertical": "bottom",
+        "surface_vertical": "center",
         "offset_x": 0,
         "offset_y": 0
       },
@@ -652,7 +652,7 @@
           "height": "13",
           "content": {
             "type": "text",
-            "template": "Fable {claude.fable:usage_line}",
+            "template": "{claude.fable:usage_line}",
             "font_family": "Segoe UI",
             "font_size": "12",
             "weight": "medium",
@@ -700,7 +700,7 @@
           "height": "13",
           "content": {
             "type": "text",
-            "template": "Fable {claude.fable:usage_line}",
+            "template": "{claude.fable:usage_line}",
             "font_family": "Segoe UI",
             "font_size": "12",
             "weight": "medium",

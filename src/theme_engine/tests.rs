@@ -342,6 +342,11 @@ fn built_in_classic_uses_149_geometry() {
     let theme = ThemeDocument::starter();
     assert_eq!(theme.id, CLASSIC_THEME_ID);
     assert_eq!(theme.name, "Classic v1");
+    assert_eq!(theme.surfaces[0].placement.vertical, VerticalAnchor::Center);
+    assert_eq!(
+        theme.surfaces[0].placement.surface_vertical,
+        Some(VerticalAnchor::Center)
+    );
     assert_eq!(theme.validate(), Vec::<String>::new());
     for (runtime, expected_width) in [
         (ThemeRuntime::new(true, false, false), 217),

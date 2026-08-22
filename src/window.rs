@@ -598,6 +598,60 @@ fn taskbar_created_message() -> u32 {
     })
 }
 
+fn track_main_taskbar(hwnd: HWND, taskbar: native_interop::TaskbarWindow, index: usize) {
+    let tray_notify = native_interop::find_child_window(taskbar.hwnd, "TrayNotifyWnd");
+    let old_hook = {
+        let mut state = lock_state();
+        let Some(state) = state.as_mut() else {
+            return;
+        };
+        if state.hwnd.to_hwnd() != hwnd {
+            return;
+        }
+        let already_tracking = state
+            .taskbar_hwnd
+            .is_some_and(|stored| stored.to_hwnd() == taskbar.hwnd)
+            && state.tray_notify_hwnd.map(SendHwnd::to_hwnd) == tray_notify
+            && state.win_event_hook.is_some();
+        if already_tracking {
+            state.taskbar_index = index;
+            state.embedded = true;
+            return;
+        }
+        state.win_event_hook.take()
+    };
+    if let Some(hook) = old_hook {
+        native_interop::unhook_win_event(hook.to_hook());
+    }
+
+    if tray_notify.is_some() {
+        diagnose::log("TrayNotifyWnd found");
+    } else {
+        diagnose::log("TrayNotifyWnd not found");
+    }
+    let hook = tray_notify.and_then(|tray_hwnd| {
+        let thread_id = native_interop::get_window_thread_id(tray_hwnd);
+        native_interop::set_tray_event_hook(thread_id, on_tray_location_changed)
+    });
+    if hook.is_some() {
+        diagnose::log("tray event hook installed");
+    } else {
+        diagnose::log("tray event hook could not be installed");
+    }
+
+    let mut state = lock_state();
+    if let Some(state) = state.as_mut() {
+        if state.hwnd.to_hwnd() != hwnd {
+            return;
+        }
+        state.taskbar_hwnd = Some(SendHwnd::from_hwnd(taskbar.hwnd));
+        state.tray_notify_hwnd = tray_notify.map(SendHwnd::from_hwnd);
+        state.win_event_hook = hook.map(SendWinEventHook::from_hook);
+        state.taskbar_index = index;
+        state.embedded = true;
+    }
+}
+
 fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
     let taskbars = native_interop::find_taskbars();
     if taskbars.is_empty() {
@@ -617,41 +671,8 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
         taskbar.rect.bottom
     ));
 
-    let old_hook = {
-        let mut state = lock_state();
-        state.as_mut().and_then(|s| s.win_event_hook.take())
-    };
-    if let Some(hook) = old_hook {
-        native_interop::unhook_win_event(hook.to_hook());
-    }
-
     native_interop::embed_in_taskbar(hwnd, taskbar.hwnd);
-
-    let tray_notify = native_interop::find_child_window(taskbar.hwnd, "TrayNotifyWnd");
-    if tray_notify.is_some() {
-        diagnose::log("TrayNotifyWnd found");
-    } else {
-        diagnose::log("TrayNotifyWnd not found");
-    }
-
-    let hook = tray_notify.and_then(|tray_hwnd| {
-        let thread_id = native_interop::get_window_thread_id(tray_hwnd);
-        native_interop::set_tray_event_hook(thread_id, on_tray_location_changed)
-    });
-    if hook.is_some() {
-        diagnose::log("tray event hook installed");
-    } else {
-        diagnose::log("tray event hook could not be installed");
-    }
-
-    let mut state = lock_state();
-    if let Some(s) = state.as_mut() {
-        s.taskbar_hwnd = Some(SendHwnd::from_hwnd(taskbar.hwnd));
-        s.tray_notify_hwnd = tray_notify.map(SendHwnd::from_hwnd);
-        s.win_event_hook = hook.map(SendWinEventHook::from_hook);
-        s.taskbar_index = index;
-        s.embedded = true;
-    }
+    track_main_taskbar(hwnd, taskbar, index);
     true
 }
 

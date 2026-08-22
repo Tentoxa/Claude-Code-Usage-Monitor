@@ -281,6 +281,11 @@ pub(super) fn position_custom_theme_internal(hwnd: HWND, theme: &ThemeDocument, 
                     let _ = ShowWindow(hwnd, SW_HIDE);
                     return;
                 };
+                let taskbar_index = taskbars
+                    .iter()
+                    .position(|candidate| candidate.hwnd == taskbar.hwnd)
+                    .unwrap_or_default();
+                track_main_taskbar(hwnd, *taskbar, taskbar_index);
                 native_interop::embed_as_child(hwnd, taskbar.hwnd);
                 let mut point = [POINT { x, y }];
                 MapWindowPoints(HWND::default(), taskbar.hwnd, &mut point);
