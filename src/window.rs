@@ -91,6 +91,7 @@ struct AppState {
 
     taskbar_index: usize,
     taskbar_device: Option<String>,
+    follow_primary_monitor: bool,
     tray_offset: i32,
     dragging: bool,
     drag_start_mouse_x: i32,
@@ -355,6 +356,8 @@ struct SettingsFile {
     taskbar_index: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     taskbar_device: Option<String>,
+    #[serde(default = "default_follow_primary_monitor")]
+    follow_primary_monitor: bool,
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -379,6 +382,7 @@ impl Default for SettingsFile {
             tray_offset: 0,
             taskbar_index: 0,
             taskbar_device: None,
+            follow_primary_monitor: true,
             poll_interval_ms: default_poll_interval(),
             language: None,
             last_update_check_unix: None,
@@ -393,6 +397,10 @@ impl Default for SettingsFile {
 
 fn default_poll_interval() -> u32 {
     POLL_15_MIN
+}
+
+fn default_follow_primary_monitor() -> bool {
+    true
 }
 
 fn default_widget_visible() -> bool {
@@ -444,6 +452,7 @@ fn save_state_settings() {
             tray_offset: s.tray_offset,
             taskbar_index: s.taskbar_index,
             taskbar_device: s.taskbar_device.clone(),
+            follow_primary_monitor: s.follow_primary_monitor,
             poll_interval_ms: s.poll_interval_ms,
             language: s
                 .language_override
@@ -619,13 +628,33 @@ fn monitor_display_name(device: &str, index: usize, monitor_word: &str) -> Strin
     }
 }
 
+fn taskbar_index_for_attachment(
+    taskbars: &[native_interop::TaskbarWindow],
+    requested_index: usize,
+    wanted: Option<&str>,
+    follow_primary_monitor: bool,
+) -> usize {
+    let preferred = if follow_primary_monitor {
+        taskbars.iter().position(|taskbar| taskbar.is_primary)
+    } else {
+        wanted
+            .and_then(|device| taskbars.iter().position(|taskbar| taskbar.device == device))
+            .or_else(|| taskbars.iter().position(|taskbar| taskbar.is_primary))
+    };
+    preferred.unwrap_or_else(|| requested_index.min(taskbars.len().saturating_sub(1)))
+}
+
 fn attach_to_taskbar(
     hwnd: HWND,
     requested_index: usize,
     requested_device: Option<&str>,
+    follow_primary_monitor: bool,
     allow_wait: bool,
 ) -> bool {
-    let wanted = requested_device.filter(|d| !d.is_empty());
+    let wanted = (!follow_primary_monitor)
+        .then_some(requested_device)
+        .flatten()
+        .filter(|device| !device.is_empty());
 
     // On startup the secondary taskbars can appear a beat after our window, so
     // the remembered monitor may not be enumerable yet. Briefly retry rather
@@ -647,16 +676,12 @@ fn attach_to_taskbar(
         return false;
     }
 
-    // Prefer the taskbar on the same physical monitor we were last anchored to.
-    // The geometric index is unstable across monitor connect/disconnect/reorder,
-    // so matching by device name keeps the widget on the user's chosen monitor.
-    // When the remembered device is gone, anchor to the primary monitor before
-    // the geometric index: index 0 is the topmost taskbar, which on setups with
-    // a vertical secondary monitor is often the secondary screen (the #43 bug).
-    let index = wanted
-        .and_then(|device| taskbars.iter().position(|t| t.device == device))
-        .or_else(|| taskbars.iter().position(|t| t.is_primary))
-        .unwrap_or_else(|| requested_index.min(taskbars.len().saturating_sub(1)));
+    // Follow the live Windows primary monitor by default. A remembered device
+    // is used only after the user explicitly selects or drags to a monitor.
+    // If that device disappears, fall back to the primary monitor before the
+    // geometric index: index 0 may be a secondary taskbar.
+    let index =
+        taskbar_index_for_attachment(&taskbars, requested_index, wanted, follow_primary_monitor);
     let taskbar = taskbars[index].clone();
     diagnose::log(format!(
         "taskbar selected index={index} device={} count={} hwnd={:?} rect=({}, {}, {}, {})",
@@ -703,6 +728,7 @@ fn attach_to_taskbar(
         s.win_event_hook = hook;
         s.taskbar_index = index;
         s.taskbar_device = Some(taskbar.device.clone());
+        s.follow_primary_monitor = follow_primary_monitor;
         s.embedded = true;
     }
     true
@@ -1534,6 +1560,7 @@ pub fn run() {
                 last_update_check_unix: settings.last_update_check_unix,
                 taskbar_index: settings.taskbar_index,
                 taskbar_device: settings.taskbar_device.clone(),
+                follow_primary_monitor: settings.follow_primary_monitor,
                 tray_offset: settings.tray_offset,
                 dragging: false,
                 drag_start_mouse_x: 0,
@@ -1548,6 +1575,7 @@ pub fn run() {
             hwnd,
             settings.taskbar_index,
             settings.taskbar_device.as_deref(),
+            settings.follow_primary_monitor,
             true,
         ) {
             embedded = true;
@@ -2553,6 +2581,18 @@ unsafe extern "system" fn wnd_proc(
                 check_theme_change();
                 check_language_change();
             }
+            if msg == WM_DISPLAYCHANGE {
+                let follows_primary = {
+                    let state = lock_state();
+                    state
+                        .as_ref()
+                        .map(|state| state.follow_primary_monitor)
+                        .unwrap_or(true)
+                };
+                if follows_primary {
+                    attach_to_taskbar(hwnd, 0, None, true, false);
+                }
+            }
             refresh_dpi();
             position_at_taskbar();
             render_layered();
@@ -2814,6 +2854,7 @@ unsafe extern "system" fn wnd_proc(
                             target_index,
                             Some(&target_taskbar.device),
                             false,
+                            false,
                         ) {
                             position_at_taskbar();
                             render_layered();
@@ -2902,7 +2943,7 @@ unsafe extern "system" fn wnd_proc(
                         }
                     }
                     // Re-anchor to the primary monitor's taskbar (device is now None).
-                    attach_to_taskbar(hwnd, 0, None, false);
+                    attach_to_taskbar(hwnd, 0, None, true, false);
                     save_state_settings();
                     position_at_taskbar();
                     render_layered();
@@ -2915,7 +2956,7 @@ unsafe extern "system" fn wnd_proc(
                     let taskbars = native_interop::find_taskbars();
                     if let Some(target) = taskbars.get(idx) {
                         let device = target.device.clone();
-                        if attach_to_taskbar(hwnd, idx, Some(&device), false) {
+                        if attach_to_taskbar(hwnd, idx, Some(&device), false, false) {
                             save_state_settings();
                             position_at_taskbar();
                             render_layered();
@@ -3781,6 +3822,49 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn taskbar(device: &str, is_primary: bool) -> native_interop::TaskbarWindow {
+        native_interop::TaskbarWindow {
+            hwnd: HWND::default(),
+            rect: RECT::default(),
+            device: device.to_string(),
+            is_primary,
+        }
+    }
+
+    #[test]
+    fn legacy_monitor_selection_defaults_to_current_primary() {
+        let taskbars = vec![
+            taskbar("\\\\.\\DISPLAY2", false),
+            taskbar("\\\\.\\DISPLAY1", true),
+        ];
+
+        assert_eq!(
+            taskbar_index_for_attachment(&taskbars, 0, Some("\\\\.\\DISPLAY2"), true),
+            1
+        );
+    }
+
+    #[test]
+    fn explicit_monitor_selection_still_uses_remembered_device() {
+        let taskbars = vec![
+            taskbar("\\\\.\\DISPLAY2", false),
+            taskbar("\\\\.\\DISPLAY1", true),
+        ];
+
+        assert_eq!(
+            taskbar_index_for_attachment(&taskbars, 0, Some("\\\\.\\DISPLAY2"), false),
+            0
+        );
+    }
+
+    #[test]
+    fn legacy_settings_migrate_to_follow_primary_monitor() {
+        let settings: SettingsFile =
+            serde_json::from_str(r#"{"taskbar_device":"\\\\.\\DISPLAY2"}"#).unwrap();
+
+        assert!(settings.follow_primary_monitor);
+    }
 
     #[test]
     fn single_available_limit_uses_one_centered_row() {
